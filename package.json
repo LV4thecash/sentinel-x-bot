@@ -1,0 +1,12 @@
+{
+  "name": "x-automations",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automated X posting bot for @Sentinel_AI_Sol",
+  "scripts": {
+    "post": "node scripts/post-tweet.js"
+  },
+  "dependencies": {
+    "twitter-api-v2": "^1.17.0"
+  }
+}
