@@ -26,9 +26,13 @@ async function main() {
     const result = await client.v2.tweet(tweetText);
     console.log(`Tweet posted successfully. ID: ${result.data.id}`);
   } catch (error) {
-    // X API duplicate tweet error code is 187
-    if (error.code === 187 || error.data?.errors?.[0]?.code === 187) {
-      console.log(`Tweet #${index} already posted (duplicate). Skipping to next.`);
+    // Duplicate tweet: X returns 403 or error code 187
+    const isDuplicate = error.code === 187
+      || error.data?.errors?.[0]?.code === 187
+      || (error.code === 403 && error.data?.detail?.includes('duplicate'))
+      || error.message?.includes('403');
+    if (isDuplicate) {
+      console.log(`Tweet #${index} likely already posted (duplicate). Skipping to next.`);
       // Fall through to increment index past the duplicate
     } else {
       console.error(`Failed to post tweet: ${error.message}`);
