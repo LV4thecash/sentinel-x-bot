@@ -9,6 +9,9 @@ concurrency:
   group: tweet-bot
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   post:
     runs-on: ubuntu-latest
