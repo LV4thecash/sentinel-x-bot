@@ -13,16 +13,17 @@ async function main() {
     accessSecret: process.env.X_ACCESS_TOKEN_SECRET,
   });
 
-  const tweets = JSON.parse(fs.readFileSync(TWEETS_PATH, 'utf-8'));
+  const data = JSON.parse(fs.readFileSync(TWEETS_PATH, 'utf-8'));
+  const tweets = data.tweets;
   const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
 
   let index = state.index % tweets.length;
-  const tweet = tweets[index];
+  const tweetText = tweets[index].text;
 
-  console.log(`Posting tweet #${index}: "${tweet.substring(0, 50)}..."`);
+  console.log(`Posting tweet #${index}: "${tweetText.substring(0, 50)}..."`);
 
   try {
-    const result = await client.v2.tweet(tweet);
+    const result = await client.v2.tweet(tweetText);
     console.log(`Tweet posted successfully. ID: ${result.data.id}`);
   } catch (error) {
     // X API duplicate tweet error code is 187
