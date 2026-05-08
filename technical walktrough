@@ -1,0 +1,407 @@
+# Sentinel Technical Walkthrough (Investor-Facing)
+
+This document explains how the product works internally, process-by-process.
+It is not a user guide. It is intended for technical due diligence, architecture review, and investor Q and A.
+
+## 1) What the product is, in one line
+
+Sentinel is a licensed, local-first intelligence pipeline that monitors Telegram and optional Discord channels, detects and validates candidate contract addresses (CA), forwards selected CAs to destination chats, and enriches operator visibility with market and PnL analytics in the extension UI.
+
+## 2) Core architecture
+
+Sentinel runs as a multi-process system with clear boundaries:
+
+1. Browser extension (control plane UI)
+- Collects configuration (credentials, chats, Discord channels, license input).
+- Sends commands to a local WebSocket control server.
+- Displays status, forwarded history, and analytics.
+
+2. Local control server (`config_server`)
+- Receives command messages over `ws://localhost:9898`.
+- Persists config files next to executable directory.
+- Starts/stops the scraper process (`telegram_forwarder`).
+- Handles local license activation/check commands.
+- Returns aggregated status and forwarding history.
+
+3. Scraper engine (`telegram_forwarder`)
+- Performs startup license validation.
+- Authenticates with Telegram via TDLib.
+- Consumes Telegram events and optional Discord gateway events.
+- Runs deterministic extraction/filter/routing logic.
+- Forwards approved CAs to destination chat.
+- Appends forwarding logs for UI consumption.
+
+4. Token database service (remote)
+- Hosts `all_tokens.json` and metadata endpoints.
+- Requires API key bearer auth.
+- Provides very frequent token universe refresh for substring-based CA detection.
+
+5. License server (remote)
+- Activates licenses against HWID.
+- Validates existing license/HWID binding at runtime.
+- Provides admin API for issuing and revoking licenses.
+
+## 3) Boot and runtime sequence
+
+### A. Installation/runtime packaging
+
+On macOS distribution branch, installer scripts copy binaries and extension assets to `/Applications/Sentinel`, install native host bridge, install LaunchAgent for auto-start of `config_server`, and ensure execution permissions and quarantine removal.
+
+Result: at machine startup, control server is expected to be available on `localhost:9898` before operator opens extension.
+
+### B. Extension startup
+
+When popup loads:
+
+1. UI initializes state and event handlers.
+2. It asks control server for HWID and license status.
+3. If not licensed, it forces navigation to license screen.
+4. It loads status, chat count, Discord config, and periodically refreshes status.
+
+The extension is command-driven: each user action maps to explicit command objects sent over WebSocket.
+
+### C. Scraper startup from extension
+
+When user clicks Start Scraper:
+
+1. Extension sends `StartScraper` command.
+2. `config_server` validates required configs (`scraper_config.json`, `chats_config.json`).
+3. `config_server` spawns `telegram_forwarder` binary from executable directory.
+4. `telegram_forwarder` performs strict startup checks in this order:
+- license validation against remote server
+- config loading
+- Telegram TDLib parameter setup
+- Telegram authentication flow completion
+- token database initial sync and watcher start
+- optional Discord listener startup
+- chat open/history warmup
+- main processing loop
+
+## 4) Config and state model
+
+Key local files (co-located with binaries):
+
+- `scraper_config.json`: Telegram API ID/hash/phone.
+- `chats_config.json`: source chats and destination chat.
+- `discord_config.json`: Discord enabled flag, token, channel IDs.
+- `license_token.dat`: activated license token bound to HWID.
+- `all_tokens.json`: token corpus for CA matching.
+- `forwarded_cas.json`: append-only forward history for extension.
+- `ca_messages_log.json`: internal message processing log.
+
+Design intent: executable-relative paths avoid working-directory drift and make packaged runtime portable.
+
+## 5) CA detection pipeline (deterministic core)
+
+This is the core value engine and is mostly non-ML, deterministic logic for reliability and low latency.
+
+### Step 1: Token corpus ingest and in-memory indexes
+
+At startup, `TokenDatabase` loads `all_tokens.json` (and can refresh from remote server). During load, it builds two indexes:
+
+1. `substrings: HashMap<String, Arc<str>>`
+- key: every 6-char slice of a CA.
+- value: canonical CA string.
+
+2. `metadata: HashMap<Arc<str>, (String, String)>`
+- key: CA.
+- value: `(symbol, name)`.
+
+The loader applies constraints before indexing:
+- parses JSON entries line-by-line (with handling for concatenated JSON objects).
+- only accepts CA lengths in expected range.
+- deduplicates by CA before inserting.
+
+Simplified indexing logic:
+
+```rust
+for each token_entry in all_tokens:
+	ca = token_entry.ca
+	if valid_length(ca) and !metadata.contains(ca):
+		for j in 0..=(ca.len() - 6):
+			part = &ca[j..j+6]
+			substrings.insert(part, ca)
+		metadata.insert(ca, (symbol, name))
+```
+
+Why this matters:
+- message-time detection becomes hash lookups instead of full corpus scans.
+- noisy chat text still matches if any embedded 6-char window overlaps known CA.
+
+### Step 2: Concurrency model and lock strategy
+
+The runtime is optimized for read-heavy message processing:
+
+- Index maps are wrapped in `Arc<RwLock<...>>`.
+- Message path uses non-blocking lock attempts (`try_read`, `try_lock`) where possible.
+- If DB is temporarily busy (sync/update), extractor skips or degrades gracefully instead of stalling the message loop.
+
+Design goal: never let token DB refresh pause live chat ingestion.
+
+### Step 3: Message ingestion sources
+
+Sentinel ingests two streams into the same CA pipeline:
+
+1. Telegram TDLib stream (`updateNewMessage`).
+2. Discord gateway stream (`MESSAGE_CREATE`) when enabled.
+
+Both sources converge into shared extraction/filter/forward logic, which keeps behavior consistent and easier to audit.
+
+### Step 4: Telegram text extraction (field-priority parser)
+
+For Telegram updates, code tries content fields in priority order:
+
+1. `"text"`
+2. `"caption"`
+3. `"formatted_text".text`
+4. `"web_page".description`
+
+Then it applies lightweight normalization (escape cleanup, trim).
+
+If no clean text is found, it runs an emergency raw-update CA scan to recover edge cases where payload shape is unusual.
+
+### Step 5: Candidate generation in `CAParser`
+
+`CAParser` uses two-stage scanning:
+
+1. Regex candidate segmentation:
+- `candidate_pattern = [A-Za-z0-9]{6,}`
+- walks alphanumeric spans likely to contain CA fragments.
+
+2. Sliding-window lookup inside each span:
+- for each candidate fragment, iterate every 6-char window.
+- check `substrings` hash map for a CA hit.
+- dedupe hits before returning.
+
+Simplified extractor logic:
+
+```rust
+matches = []
+for fragment in regex_find_all(text, /[A-Za-z0-9]{6,}/):
+	for i in 0..=(fragment.len()-6):
+		part = fragment[i..i+6]
+		if part contains blocked_noise_words: continue
+		if substrings_map.has(part):
+			ca = substrings_map[part]
+			push_unique(matches, ca)
+return matches
+```
+
+Complexity intuition:
+- Let $n$ be message text length.
+- Candidate scan is roughly linear in $n$.
+- Window checks are linear in total candidate span length.
+- Hash lookup is expected $O(1)$ per window.
+
+So practical runtime is near-linear per message, which is critical for live channels.
+
+### Step 6: Context gating and decision rules
+
+After candidate CAs are found, system applies deterministic gating:
+
+1. Warning phrase logic
+- Detects phrases like `do not buy` / `dont buy`.
+- If warning + CA in same message: block forward.
+- If warning without CA: set one-shot skip flag for next CA (`SKIP_NEXT_CA`).
+
+2. Symbol/name safety filters
+- Looks up `(symbol, name)` from metadata.
+- Applies banned keyword regex checks.
+- Blocks suspicious results.
+
+3. Ordinal disambiguation
+- Regex-based ordinal detector interprets phrases like:
+  - `buy the 2nd`
+  - `the third contract`
+  - `only the first`
+- If multiple CAs are extracted, ordinal selects the specific indexed candidate.
+
+This keeps selection deterministic and explainable in postmortems.
+
+### Step 7: Fallback extraction paths (when direct text fails)
+
+If primary message text has no CA:
+
+1. URL scraping fallback
+- finds URL token in message.
+- performs fast HTTP fetch + HTML body parse.
+- regex scans body text for CA-shaped strings.
+
+2. Selenium fallback
+- if static scrape fails and driver available.
+- opens page and extracts rendered body text.
+
+3. Telegram link deep scan
+- detects `t.me/...` references.
+- calls local scanner endpoint for linked message content.
+- re-runs same CA parser + filters on returned lines.
+
+Important: fallbacks reuse the same final gating rules, so safety/selection logic stays consistent.
+
+### Step 8: Forwarding path and audit trail
+
+When a CA survives all checks:
+
+1. `forward_ca(...)` sends message to destination Telegram chat via TDLib.
+2. `log_forwarded_ca(...)` appends JSON line to `forwarded_cas.json` with:
+- `ca`
+- `symbol`
+- `name`
+- `timestamp`
+- `source` (`telegram` or `discord`)
+
+This append-only log is then consumed by extension `GetForwards` for Recent Forwards UI and downstream enrichment.
+
+### Step 9: Reliability and anti-stall behavior in long sessions
+
+The loop contains operational safeguards:
+
+- heartbeat requests on idle periods.
+- periodic chat refresh/open calls to keep TDLib session warm.
+- message-gap tracking heuristics (`last_message_ids`) for observability.
+- non-fatal handling when metadata DB is busy.
+
+Net effect: high-throughput CA scraping remains resilient during long runtime windows without requiring frequent restarts.
+
+## 6) Discord integration path
+
+Discord is optional and isolated behind configuration.
+
+When enabled:
+
+1. Forwarder opens gateway WebSocket (`wss://gateway.discord.gg`).
+2. Sends identify payload with user token.
+3. Filters events to configured channel IDs.
+4. Sends message content into same CA pipeline as Telegram.
+
+Important architecture point: Discord is an additional source, not a separate engine. It converges to one shared detection and forwarding pipeline.
+
+## 7) Licensing system internals
+
+Licensing has three layers:
+
+1. HWID generation
+- Windows uses machine GUID-derived hash format.
+- macOS uses hardware UUID (`system_profiler`/`ioreg`) hashed to normalized HWID format.
+
+2. Activation
+- Extension sends `ActivateLicense` to local `config_server`.
+- `config_server` calls license server `/activate`.
+- On success, local `license_token.dat` is written.
+
+3. Runtime enforcement
+- `telegram_forwarder` validates local token plus remote `/validate` before pipeline starts.
+- HWID mismatch or server invalidation blocks startup.
+
+Investor note: control server check can be shallow (token existence), but scraper startup enforcement is hard gate and is the meaningful protection point.
+
+## 8) Token server and data synchronization
+
+Remote token server exposes:
+
+- `/all_tokens.json` for direct corpus download.
+- lookup/metadata APIs for structured access.
+- bearer-token auth.
+
+Forwarder-side `TokenDatabase` periodically refreshes from remote and atomically swaps maps, minimizing lock contention in message loop.
+
+Net effect: detection logic remains current with token universe without requiring restart.
+
+## 9) Extension analytics and AI features
+
+The extension has two analytics layers:
+
+1. Deterministic analytics
+- Recent forwards rendered from `forwarded_cas.json`.
+- FDV/liquidity enrichment from DexScreener.
+- Wallet PnL pipeline from Helius swap history + symbol enrichment + card generation.
+
+2. AI augmentation (optional)
+- Operator can store Groq API key in local storage.
+- Extension sends compact token context (CA, symbol, FDV, source) to Groq chat completions.
+- Model returns one-sentence insights per token, shown inline in Recent Forwards.
+- Feature is fail-soft: if key missing/error, system still works fully.
+
+## 10) Why AI here (and why not everywhere)
+
+### What AI is used for
+
+AI is used as a thin interpretation layer for human decision speed:
+- concise, contextual risk/opportunity hints on top of deterministic market facts.
+- natural-language summarization where fixed rules are weak or verbose.
+
+### What AI is intentionally not used for
+
+AI is not used for:
+- raw CA extraction.
+- routing and forwarding decisions.
+- licensing decisions.
+- low-latency control loops.
+
+Reason: these functions need deterministic behavior, lower latency variance, and auditability.
+
+### Investor-grade rationale
+
+This split is deliberate product strategy:
+
+1. Deterministic core for trust and reliability
+- mission-critical signal path stays explainable and testable.
+
+2. AI at the edge for UX advantage
+- improves operator comprehension and speed without introducing core fragility.
+
+3. Cost and risk control
+- AI calls are optional and scoped.
+- no AI dependency for baseline product function.
+
+4. Future upside
+- architecture allows progressive AI additions (ranking, anomaly commentary, semantic clustering) without rewriting the extraction/forwarding core.
+
+## 11) Security and operational considerations
+
+Key strengths:
+- Local-first command/control path over localhost WebSocket.
+- Executable-relative config reduces path confusion in packaged runtime.
+- License enforcement at startup before scraper activates.
+- API-key gate on token server endpoints.
+
+Observed risks and trade-offs:
+- Some secrets are currently local/plaintext (config/token conventions).
+- Hardcoded defaults and credentials exist in code paths and should be rotated/managed.
+- Discord user-token model carries account and compliance risk profile.
+- Control server port conflict handling is implemented but operational monitoring can be improved.
+
+## 12) What to say when asked "is this real AI or fake AI?"
+
+Short answer:
+- The core product is an engineering-heavy deterministic pipeline.
+- AI is real but intentionally scoped to analyst augmentation.
+- We do not use AI as a black-box replacement for extraction/forwarding correctness.
+
+Long answer:
+- Sentinel uses AI where language interpretation helps users decide faster.
+- It avoids AI where deterministic correctness, latency, and reproducibility are mandatory.
+- This is a pragmatic AI architecture: measurable utility, bounded cost, and constrained risk.
+
+## 13) Typical end-to-end flow (compressed)
+
+1. User opens extension.
+2. Extension checks license and local service status.
+3. User configures Telegram and chats (and optional Discord).
+4. User starts scraper.
+5. Scraper validates license with remote server.
+6. Scraper authenticates Telegram and begins stream processing.
+7. Messages are parsed, CAs extracted, filtered, and forwarded.
+8. Forward logs are persisted.
+9. Extension shows forwards, market enrichment, optional AI insights, and PnL analytics.
+
+## 14) Technical moat summary
+
+Sentinel moat is not a single model; it is the integrated system behavior:
+
+- fast deterministic CA detection against continuously refreshed token corpus
+- source-agnostic ingestion (Telegram + Discord)
+- local control plane with remote licensing and token infra
+- analytics stack that combines deterministic data with optional AI interpretation
+
+That combination is difficult to replicate quickly because it spans protocol integration, runtime orchestration, detection heuristics, operations, and UX-level decision acceleration.
